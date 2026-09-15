@@ -201,6 +201,3 @@ Body: `{"username": "new-name"}`. Moves picks when a customer's IPTV Boss user n
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest pytest-aiohttp
 .venv/bin/python -m pytest
 ```
-
-`tests/fixtures` holds real IPTV Boss responses with the passwords removed. The tests
-run a fake IPTV Boss from them.
