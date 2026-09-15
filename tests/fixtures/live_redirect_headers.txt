@@ -1,0 +1,13 @@
+HTTP/1.1 302 Found
+Date: Mon, 14 Sep 2026 01:30:35 GMT
+Content-Type: text/plain
+Cache-Control: no-store, max-age=0
+Pragma: no-cache
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+Content-Security-Policy: default-src 'self'; img-src 'self' https://iptvboss.pro data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+Location: http://whistvnet.com/live/PROVIDERUSER/PROVIDERPASS/1144315.ts
+Content-Length: 10
+

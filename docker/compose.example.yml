@@ -1,0 +1,19 @@
+# Add the middleware next to an existing IPTV Boss XC server.
+# Point your reverse proxy (or customers) at port 8002 instead of IPTV Boss's port.
+services:
+  boss-middleware:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: boss-middleware
+    restart: unless-stopped
+    environment:
+      MW_BOSS_URL: "http://iptvboss:8001"     # IPTV Boss XC server, reachable from this container
+      MW_API_KEY: "change-me-to-a-long-random-value"
+      MW_NEW_CATEGORIES: "show"               # show or hide categories a customer hasn't decided on
+      MW_ENFORCE_STREAMS: "true"
+      # MW_FORWARDED_PROTO: "https"           # if IPTV Boss runs with BEHIND_HTTPS_PROXY=true
+    ports:
+      - "127.0.0.1:8002:8002"
+    volumes:
+      - ./middleware-data:/data
