@@ -1,6 +1,6 @@
 # Changelog
 
-## v2 (0.2.0)
+## 1.0.0
 
 - **Fix: gzip sent to clients that didn't ask for it.** When a request had no
   `Accept-Encoding`, aiohttp added `Accept-Encoding: gzip` on the way to IPTV Boss, and

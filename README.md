@@ -132,7 +132,7 @@ address for both IPTV Boss's own API and this one.
 
 ### `GET /middleware/v1/health`
 
-`{"status": "ok", "version": "0.2.0", "boss": "ok"}`
+`{"status": "ok", "version": "1.0.0", "boss": "ok"}`
 
 ### `POST /middleware/v1/categories/refresh`
 
