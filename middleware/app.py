@@ -1,10 +1,12 @@
 """The web app: proxies IPTV Boss, filters for customers with picks, and serves the panel API.
 
-Customers without picks get IPTV Boss's answers untouched. When filtering
-fails for any reason the unfiltered answer is sent, so the middleware can show
-a customer too much but never breaks their player.
+Customers without picks get IPTV Boss's answers untouched (apart from ids
+kept inside 32 bits, see idmap.py). When filtering fails for any reason the
+unfiltered answer is sent, so the middleware can show a customer too much
+but never breaks their player.
 """
 import asyncio
+import gzip
 import hmac
 import json
 import logging
@@ -12,11 +14,12 @@ import os
 import re
 import time
 import zlib
-from urllib.parse import parse_qs, urlencode
+from collections import OrderedDict
+from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
-from . import __version__
+from . import __version__, idmap
 from .filters import empty_epg, filter_categories, filter_m3u, filter_panel_api, filter_rows
 from .guide import GuideStore, file_version, gzip_stream
 from .store import TYPES, Store
@@ -28,8 +31,12 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
               "trailers", "transfer-encoding", "upgrade"}
 CATEGORY_ACTIONS = {"get_live_categories": "live", "get_vod_categories": "vod", "get_series_categories": "series"}
 LIST_ACTIONS = {"get_live_streams": "live", "get_vod_streams": "vod", "get_series": "series"}
+# Answers that carry stream or series ids: they are kept inside 32 bits for players (idmap.py).
+ID_ACTIONS = set(LIST_ACTIONS) | {"get_vod_info", "get_series_info", "get_short_epg", "get_simple_data_table"}
+ID_PARAMS = ("stream_id", "series_id", "vod_id")
 STREAM_PATHS = {"live": "live", "movie": "vod", "series": "series"}
 MAP_MAX_AGE = 300
+LIST_CACHE_MIN = 256 * 1024     # smaller lists are prepared per request; caching them buys nothing
 
 
 def json_response(data, status=200):
@@ -43,16 +50,30 @@ def raw_response(status, headers, body):
     return resp
 
 
+def passthrough_response(status, headers, body):
+    """A whole answer sent on with its headers, so a redirect keeps its Location."""
+    resp = web.Response(status=status, body=body)
+    for k, v in headers.items():
+        if k.lower() not in HOP_BY_HOP and k.lower() not in ("content-length", "content-encoding"):
+            resp.headers.add(k, v)
+    return resp
+
+
 class Middleware:
     def __init__(self, config):
         self.config = config
         os.makedirs(config.data_dir, exist_ok=True)
-        self.store = Store(os.path.join(config.data_dir, "middleware.db"), config.new_categories)
+        self.store = Store(os.path.join(config.data_dir, "middleware.db"), config.new_categories,
+                           config.category_grace_days)
         self.streams = StreamIndex()
         self.guides = GuideStore(config.data_dir)
         self.session = None
         self._guide_locks = {}
         self._map_locks = {}
+        self._recorded = set()                    # (type, layout, size, crc32) already written to the store
+        self._lists = OrderedDict()               # (size, crc32) -> (compacted, gzipped): full lists, no picks
+        self._lists_bytes = 0
+        self._list_locks = {}
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -70,15 +91,20 @@ class Middleware:
 
     # ---- helpers --------------------------------------------------------
 
+    @staticmethod
+    def path_qs(request):
+        """What to ask IPTV Boss for: the player's own path, or one with its compacted ids expanded."""
+        return request.get("mw_path_qs") or request.rel_url.path_qs
+
     def upstream(self, request):
-        return self.config.boss_url + request.rel_url.path_qs
+        return self.config.boss_url + self.path_qs(request)
 
     @staticmethod
     def forward_headers(request, drop_encoding=False):
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP}
         headers.pop("Content-Length", None)
         # No Accept-Encoding from the client: ask for identity, else aiohttp adds gzip and we stream it back undecoded.
-        if drop_encoding or "Accept-Encoding" not in request.headers:
+        if drop_encoding or "Accept-Encoding" not in headers:
             headers.pop("Accept-Encoding", None)
             headers["Accept-Encoding"] = "identity"
         if request.remote and "X-Forwarded-For" not in headers:
@@ -108,6 +134,25 @@ class Middleware:
                     merged.setdefault(key, values[0])
         return merged
 
+    @staticmethod
+    def expand_ids(request, params):
+        """Turn compacted ids a player sends back into IPTV Boss's real ids, in the query and the form body."""
+        expanded = idmap.expand_params(params, ID_PARAMS)
+        if expanded is None:
+            return params
+        raw_query = request.rel_url.raw_query_string
+        if raw_query:
+            new_query = re.sub(r"((?:^|&)(?:stream_id|series_id|vod_id)=)(\d+)",
+                               lambda m: m.group(1) + str(idmap.expand(m.group(2))), raw_query)
+            if new_query != raw_query:
+                request["mw_path_qs"] = request.rel_url.raw_path + "?" + new_query
+        body = request.get("mw_body")
+        if body and "form" in request.headers.get("Content-Type", ""):
+            form = [(k, idmap.expand(v) if k in ID_PARAMS else v)
+                    for k, v in parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True)]
+            request["mw_body"] = urlencode(form).encode("utf-8")
+        return expanded
+
     async def proxy(self, request):
         """Pass a request to IPTV Boss and stream the answer back unchanged."""
         if "mw_body" in request:
@@ -133,6 +178,21 @@ class Middleware:
             log.warning("IPTV Boss did not answer %s: %s", request.rel_url.path, e)
             return web.Response(status=502, text="Upstream unavailable")
 
+    async def proxy_ids(self, request):
+        """Like proxy(), but the whole answer is read so oversized ids can be compacted.
+
+        Anything that is not a JSON 200 (IPTV Boss answers info lookups with a redirect to the
+        provider) is sent on with all of its headers, so the redirect still works.
+        """
+        try:
+            status, headers, body = await self.fetch_like(request)
+        except (asyncio.TimeoutError, OSError) as e:
+            log.warning("IPTV Boss did not answer %s: %s", request.rel_url.path, e)
+            return web.Response(status=502, text="Upstream unavailable")
+        if status == 200 and "json" in headers.get("Content-Type", "").lower():
+            return raw_response(status, headers, idmap.compact_json(body))
+        return passthrough_response(status, headers, body)
+
     async def fetch(self, method, path_qs, headers=None, data=None):
         """Fetch from IPTV Boss uncompressed. Returns (status, headers, body bytes)."""
         headers = dict(headers or {})
@@ -147,7 +207,7 @@ class Middleware:
 
     async def fetch_like(self, request):
         """Repeat the player's own request against IPTV Boss, uncompressed."""
-        return await self.fetch(request.method, request.rel_url.path_qs, self.forward_headers(request, True),
+        return await self.fetch(request.method, self.path_qs(request), self.forward_headers(request, True),
                                 request.get("mw_body"))
 
     async def ensure_map(self, ctype, username, password, layout=None):
@@ -170,19 +230,70 @@ class Middleware:
                 self.store.record_layout_categories(ctype, found, self.streams.layout_categories(ctype, found))
             return found or layout
 
+    def record_categories(self, ctype, layout, body, rows):
+        """Write a category list to the catalogue once per distinct answer."""
+        seen = (ctype, layout, len(body), zlib.crc32(body))
+        if seen in self._recorded:
+            return
+        self.store.record_categories(ctype, rows, layout)
+        if layout:
+            self.store.record_layout_categories(
+                ctype, layout, [r.get("category_id") for r in rows if isinstance(r, dict)], mark_removed=True)
+        if len(self._recorded) > 512:
+            self._recorded.clear()
+        self._recorded.add(seen)
+
+    # ---- full lists for customers without picks ---------------------------
+
+    async def full_list(self, request, headers, body):
+        """A full list for a customer without picks: ids compacted, no parsing, prepared once per distinct answer."""
+        wants_gzip = "gzip" in request.headers.get("Accept-Encoding", "").lower()
+        loop = asyncio.get_running_loop()
+        budget = self.config.list_cache_mb * 1024 * 1024
+        if len(body) < LIST_CACHE_MIN or budget <= 0:
+            compacted = idmap.compact_json(body)
+            payload = gzip.compress(compacted, compresslevel=5, mtime=0) if wants_gzip else compacted
+        else:
+            key = (len(body), await loop.run_in_executor(None, zlib.crc32, body))
+            entry = self._lists.get(key)
+            if entry is None:
+                lock = self._list_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    entry = self._lists.get(key)
+                    if entry is None:
+                        compacted = await loop.run_in_executor(None, idmap.compact_json, body)
+                        zipped = await loop.run_in_executor(None, _gzip, compacted)
+                        entry = (compacted, zipped)
+                        self._lists[key] = entry
+                        self._lists_bytes += len(compacted) + len(zipped)
+                        while self._lists_bytes > budget and len(self._lists) > 1:
+                            _, old = self._lists.popitem(last=False)
+                            self._lists_bytes -= len(old[0]) + len(old[1])
+                self._list_locks.pop(key, None)
+            if key in self._lists:
+                self._lists.move_to_end(key)
+            payload = entry[1] if wants_gzip else entry[0]
+        resp = web.Response(status=200, body=payload)
+        resp.headers["Content-Type"] = headers.get("Content-Type", "application/json")
+        resp.headers["Vary"] = "Accept-Encoding"
+        if wants_gzip:
+            resp.headers["Content-Encoding"] = "gzip"
+        return resp
+
     # ---- player_api.php --------------------------------------------------
 
     async def player_api(self, request):
-        p = await self.params(request)
+        p = self.expand_ids(request, await self.params(request))
         username, action = p.get("username", ""), p.get("action", "")
         watched = action in CATEGORY_ACTIONS or action in LIST_ACTIONS
+        plain = self.proxy_ids if action in ID_ACTIONS else self.proxy
         if not username or (not watched and not self.filters(username)):
-            return await self.proxy(request)
+            return await plain(request)
         try:
             return await self._player_api(request, p)
         except Exception:
             log.exception("filtering player_api %s failed; sending it unfiltered", action)
-            return await self.proxy(request)
+            return await plain(request)
 
     async def _player_api(self, request, p):
         username, password, action = p.get("username", ""), p.get("password", ""), p.get("action", "")
@@ -195,11 +306,7 @@ class Middleware:
                 return raw_response(status, headers, body)
             rows = json.loads(body)
             if isinstance(rows, list):
-                self.store.record_categories(ctype, rows)
-                layout = self.streams.layout_for_user(username)
-                if layout:
-                    self.store.record_layout_categories(
-                        ctype, layout, [r.get("category_id") for r in rows if isinstance(r, dict)], mark_removed=True)
+                self.record_categories(ctype, self.streams.layout_for_user(username), body, rows)
             if not self.filters(username, ctype):
                 return raw_response(status, headers, body)
             return json_response(filter_categories(rows, ctype, allows))
@@ -208,35 +315,43 @@ class Middleware:
             ctype = LIST_ACTIONS[action]
             status, headers, body = await self.fetch_like(request)
             if status != 200:
-                return raw_response(status, headers, body)
+                return passthrough_response(status, headers, body)
+            if not self.filters(username, ctype):
+                # Nothing to filter, so nothing is parsed: the map for this layout loads when it is needed.
+                return await self.full_list(request, headers, body)
             rows = json.loads(body)
             category = p.get("category_id")
             if category in (None, "") and isinstance(rows, list):
                 layout = self.streams.update(ctype, rows, username)
                 if layout:
                     self.store.record_layout_categories(ctype, layout, self.streams.layout_categories(ctype, layout))
-            if not self.filters(username, ctype):
-                return raw_response(status, headers, body)
             if category not in (None, "") and not allows(ctype, category):
                 return json_response([])
-            return json_response(filter_rows(rows, ctype, allows))
+            return self.json_ids(filter_rows(rows, ctype, allows))
 
         if action in ("get_short_epg", "get_simple_data_table") and self.filters(username, "live"):
             if not await self.item_allowed("live", p.get("stream_id", ""), username, password, allows):
                 return json_response(empty_epg())
-            return await self.proxy(request)
+            return await self.proxy_ids(request)
 
         if action == "get_vod_info" and self.filters(username, "vod"):
             if not await self.item_allowed("vod", p.get("vod_id", ""), username, password, allows):
                 return json_response({"info": [], "movie_data": []})
-            return await self.proxy(request)
+            return await self.proxy_ids(request)
 
         if action == "get_series_info" and self.filters(username, "series"):
             if not await self.item_allowed("series", p.get("series_id", ""), username, password, allows):
                 return json_response({"seasons": [], "info": [], "episodes": {}})
-            return await self.proxy(request)
+            return await self.proxy_ids(request)
 
+        if action in ID_ACTIONS:
+            return await self.proxy_ids(request)
         return await self.proxy(request)
+
+    @staticmethod
+    def json_ids(data):
+        body = json.dumps(data, separators=(",", ":")).encode("utf-8")
+        return web.Response(body=idmap.compact_json(body), content_type="application/json")
 
     async def item_allowed(self, ctype, item_id, username, password, allows):
         layout = layout_of(item_id)
@@ -254,15 +369,15 @@ class Middleware:
     async def panel_api(self, request):
         username = (await self.params(request)).get("username", "")
         if not self.filters(username):
-            return await self.proxy(request)
+            return await self.proxy_ids(request)
         try:
             status, headers, body = await self.fetch_like(request)
             if status != 200:
-                return raw_response(status, headers, body)
-            return json_response(filter_panel_api(json.loads(body), self.allows_fn(username)))
+                return passthrough_response(status, headers, body)
+            return self.json_ids(filter_panel_api(json.loads(body), self.allows_fn(username)))
         except Exception:
             log.exception("filtering panel_api failed; sending it unfiltered")
-            return await self.proxy(request)
+            return await self.proxy_ids(request)
 
     # ---- get.php ------------------------------------------------------------
 
@@ -335,11 +450,18 @@ class Middleware:
         return resp
 
     async def ensure_guide(self, layout, username, password):
-        """Rebuild the layout's guide index when IPTV Boss's guide has changed."""
+        """Rebuild the layout's guide index when IPTV Boss's guide has changed.
+
+        While one request rebuilds, the others keep using the index that is already there. A
+        download that is not a whole guide (IPTV Boss answers with an empty body while it is
+        writing a new file) is thrown away and the current index stays.
+        """
         index = self.guides.get(layout)
         if index and self.guides.checked_recently(layout, self.config.guide_recheck_seconds):
             return index
         lock = self._guide_locks.setdefault(layout, asyncio.Lock())
+        if lock.locked() and index:
+            return index
         async with lock:
             index = self.guides.get(layout)
             if index and self.guides.checked_recently(layout, self.config.guide_recheck_seconds):
@@ -357,6 +479,9 @@ class Middleware:
                 spool.close()
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, _unpack, raw_path, xml_path, compressed)
+                if not await loop.run_in_executor(None, _whole_guide, xml_path):
+                    log.warning("IPTV Boss sent an incomplete guide for layout %s; keeping the current one", layout)
+                    return index
                 version = await loop.run_in_executor(None, file_version, xml_path)
                 self.guides.mark_checked(layout)
                 if index and index.version == version:
@@ -377,11 +502,20 @@ class Middleware:
     # ---- streams ------------------------------------------------------------
 
     async def stream(self, request):
-        ctype = STREAM_PATHS.get(request.match_info["kind"])
+        kind = request.match_info["kind"]
+        ctype = STREAM_PATHS.get(kind)
         username = request.match_info.get("username", "")
-        # Series URLs carry episode ids, which can't be tied to a category, so series streams always play.
+        tail = request.match_info.get("tail", "")
+        # Series URLs carry episode ids, which are not IPTV Boss stream ids: never expanded, never refused.
+        if kind != "series":
+            real = idmap.expand_stream_tail(tail)
+            if real is not None:
+                tail = real
+                head, _, last = request.rel_url.raw_path.rpartition("/")
+                query = ("?" + request.rel_url.raw_query_string) if request.rel_url.raw_query_string else ""
+                request["mw_path_qs"] = head + "/" + idmap.expand_stream_tail(last) + query
         if ctype and ctype != "series" and self.config.enforce_streams and self.filters(username, ctype):
-            item = re.sub(r"\.[A-Za-z0-9]+$", "", request.match_info.get("tail", "").rsplit("/", 1)[-1])
+            item = re.sub(r"\.[A-Za-z0-9]+$", "", tail.rsplit("/", 1)[-1])
             cats = self.streams.categories_of(ctype, item)
             if cats:
                 allows = self.allows_fn(username)
@@ -423,7 +557,8 @@ class Middleware:
         elif request.method != "GET":
             return json_response({"error": "method_not_allowed"}, 405)
         return json_response({"new_categories": self.store.new_categories_rule(),
-                              "enforce_streams": self.config.enforce_streams})
+                              "enforce_streams": self.config.enforce_streams,
+                              "category_grace_days": self.config.category_grace_days})
 
     async def api_categories(self, request):
         ctype = request.query.get("type")
@@ -443,6 +578,8 @@ class Middleware:
         username, password = str(body.get("username", "")), str(body.get("password", ""))
         if not username or not password:
             return json_response({"error": "invalid", "message": "username and password are required"}, 422)
+        told = body.get("layout")
+        told = int(told) if isinstance(told, int) or (isinstance(told, str) and told.isdigit()) else None
         counts = {}
         for action, ctype in CATEGORY_ACTIONS.items():
             qs = "/player_api.php?" + urlencode({"username": username, "password": password, "action": action})
@@ -452,13 +589,13 @@ class Middleware:
             rows = json.loads(raw)
             if not isinstance(rows, list):
                 return json_response({"error": "boss", "message": "IPTV Boss rejected the login"}, 502)
-            self.store.record_categories(ctype, rows)
-            layout = await self.ensure_map(ctype, username, password)
-            if layout:
-                self.store.record_layout_categories(
-                    ctype, layout, [r.get("category_id") for r in rows if isinstance(r, dict)], mark_removed=True)
+            # The panel knows which layout its service is on and says so; otherwise the login's own ids tell.
+            found = await self.ensure_map(ctype, username, password)
+            layout = told if told is not None else found
+            self.record_categories(ctype, layout, raw, rows)
             counts[ctype] = len(rows)
-        return json_response({"categories": counts, "layout": self.streams.layout_for_user(username)})
+        layout = told if told is not None else self.streams.layout_for_user(username)
+        return json_response({"categories": counts, "layout": layout})
 
     async def api_picks(self, request):
         username = request.match_info["username"]
@@ -478,7 +615,9 @@ class Middleware:
         if not isinstance(body, dict):
             raise ValueError("body must be an object keyed by live, vod and series")
         rule = str(body.get("new_categories", "default"))
-        layout = self.streams.layout_for_user(username)
+        told = body.get("layout")
+        told = int(told) if isinstance(told, int) or (isinstance(told, str) and str(told).isdigit()) else None
+        layout = told if told is not None else self.streams.layout_for_user(username)
         for ctype in TYPES:
             if ctype not in body:
                 continue
@@ -487,8 +626,14 @@ class Middleware:
                 self.store.save_picks(username, ctype, "all", [], [], rule)
             elif isinstance(value, list):
                 chosen = {str(v) for v in value}
-                known = {r["id"] for r in self.store.categories(ctype, layout=layout)}
-                self.store.save_picks(username, ctype, "selected", chosen, known - chosen, rule)
+                if layout is not None:
+                    known = {r["id"] for r in self.store.categories(ctype, layout=layout)}
+                    self.store.save_picks(username, ctype, "selected", chosen, known - chosen, rule)
+                else:
+                    # Which layout this customer is on is not known yet (a brand new line): hide the rest,
+                    # rather than excluding another layout's ids by mistake.
+                    self.store.save_picks(username, ctype, "selected", chosen, [],
+                                          "hide" if rule == "default" else rule)
             elif isinstance(value, dict):
                 self.store.save_picks(username, ctype, str(value.get("mode", "selected")),
                                       value.get("included") or [], value.get("excluded") or [],
@@ -499,13 +644,14 @@ class Middleware:
     def describe_picks(self, username):
         picks = self.store.picks(username)
         rule = self.store.new_categories_rule()
-        out = {"username": username, "default_new_categories": rule, "types": {}}
+        layout = self.streams.layout_for_user(username)
+        out = {"username": username, "default_new_categories": rule, "layout": layout, "types": {}}
         for ctype, pk in picks.items():
             entry = pk.as_dict()
             entry["effective_new_categories"] = pk.rule(rule)
             entry["undecided"] = []
             if pk.filters:
-                for row in self.store.categories(ctype):
+                for row in self.store.categories(ctype, layout=layout):
                     if row["id"] not in pk.included and row["id"] not in pk.excluded:
                         entry["undecided"].append({"id": row["id"], "name": row["name"],
                                                    "first_seen": row["first_seen"]})
@@ -545,6 +691,23 @@ def _unpack(raw_path, xml_path, compressed):
                 else:
                     data = b""
         dst.write(d.flush())
+
+
+def _gzip(data):
+    return gzip.compress(data, compresslevel=5, mtime=0)
+
+
+def _whole_guide(xml_path):
+    """A guide is only worth installing when it is a complete XMLTV file: non-empty and closed with </tv>."""
+    try:
+        size = os.path.getsize(xml_path)
+        if size < 16:
+            return False
+        with open(xml_path, "rb") as f:
+            f.seek(max(0, size - 64))
+            return b"</tv>" in f.read()
+    except OSError:
+        return False
 
 
 async def _json_body(request):

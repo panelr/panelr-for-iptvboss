@@ -105,16 +105,15 @@ async def test_new_category_follows_rule(mw):
     assert "9999" in ids
 
 
-async def test_removed_category_is_flagged(mw):
+async def test_a_category_that_disappears_is_kept_by_default(mw):
+    # 1.1.0: sports groups empty out between seasons, so nothing is marked removed unless MW_CATEGORY_GRACE_DAYS says so
     mw.boss.extra_live_category = extra_category()
     await refresh(mw)
     mw.boss.extra_live_category = None
+    mw.server.app["middleware"]._recorded.clear()
     await refresh(mw)
-    cats = await (await mw.get("/middleware/v1/categories?type=live&include_removed=1", headers=auth())).json()
-    gone = [c for c in cats["live"] if c["id"] == "9999"]
-    assert gone and gone[0]["removed_at"]
     active = await (await mw.get("/middleware/v1/categories?type=live", headers=auth())).json()
-    assert all(c["id"] != "9999" for c in active["live"])
+    assert any(c["id"] == "9999" for c in active["live"])
 
 
 async def test_clearing_picks_restores_everything(mw):

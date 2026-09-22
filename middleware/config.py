@@ -22,6 +22,8 @@ class Config:
     guide_recheck_seconds: int
     request_timeout: int
     forwarded_proto: str      # X-Forwarded-Proto for IPTV Boss when the player's proxy sends none: "" | http | https
+    category_grace_days: int  # days a category may be missing before it is marked removed; 0 = never
+    list_cache_mb: int        # memory for prepared full lists (customers without picks); 0 = off
 
     @classmethod
     def from_env(cls, env=None):
@@ -37,6 +39,12 @@ class Config:
         proto = env.get("MW_FORWARDED_PROTO", "").strip().lower()
         if proto not in ("", "http", "https"):
             raise SystemExit("MW_FORWARDED_PROTO must be http, https or empty")
+        grace = _int(env, "MW_CATEGORY_GRACE_DAYS", 0)
+        if grace < 0:
+            raise SystemExit("MW_CATEGORY_GRACE_DAYS must be 0 (never) or a number of days")
+        cache_mb = _int(env, "MW_LIST_CACHE_MB", 64)
+        if cache_mb < 0:
+            raise SystemExit("MW_LIST_CACHE_MB must be 0 (off) or a number of megabytes")
         return cls(
             boss_url=env.get("MW_BOSS_URL", "http://127.0.0.1:8001").rstrip("/"),
             listen_host=env.get("MW_LISTEN_HOST", "0.0.0.0"),
@@ -48,4 +56,16 @@ class Config:
             guide_recheck_seconds=int(env.get("MW_GUIDE_RECHECK_SECONDS", "60")),
             request_timeout=int(env.get("MW_REQUEST_TIMEOUT", "300")),
             forwarded_proto=proto,
+            category_grace_days=grace,
+            list_cache_mb=cache_mb,
         )
+
+
+def _int(env, name, default):
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        raise SystemExit(f"{name} must be a whole number")

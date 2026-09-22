@@ -54,7 +54,9 @@ player  ->  your web server / reverse proxy  ->  middleware :8002  ->  IPTV Boss
 ```
 
 - IPTV Boss still checks logins and builds the playlist and guide.
-- Customers without picks get IPTV Boss's answers untouched.
+- Customers without picks get IPTV Boss's answers untouched, apart from ids past 32 bits,
+  which are compacted for players that store ids as an int (TiviMate) and expanded back
+  on the way in.
 - For customers with picks, the middleware trims:
   - category lists and channel, movie and series lists (`player_api.php`)
   - the M3U playlist (`get.php`)
@@ -81,7 +83,9 @@ Each customer can override it. `GET .../picks` lists a customer's undecided
 categories, so a panel can tell them something new is available.
 
 Category ids are IPTV Boss group ids. Renaming or reordering a group, or rebuilding
-the lineup, keeps them. A deleted group is marked removed, and dropped from picks.
+the lineup, keeps them. They repeat across layouts, so the catalogue is kept per layout.
+A group that disappears is kept (sports groups empty out between seasons) unless
+`MW_CATEGORY_GRACE_DAYS` is set, in which case it is marked removed after that many days.
 
 ### The guide
 
@@ -122,6 +126,9 @@ IPTV Boss's data.
 | `MW_DATA_DIR` | `/data` | Database and guide files |
 | `MW_GUIDE_RECHECK_SECONDS` | `60` | How often a guide request checks IPTV Boss for a newer guide |
 | `MW_REQUEST_TIMEOUT` | `300` | Seconds to wait on IPTV Boss |
+| `MW_FORWARDED_PROTO` | empty | `https` when IPTV Boss runs with `BEHIND_HTTPS_PROXY=true` and no proxy sets `X-Forwarded-Proto` |
+| `MW_CATEGORY_GRACE_DAYS` | `0` | Days a category may be missing before it is marked removed; `0` never marks one removed |
+| `MW_LIST_CACHE_MB` | `64` | Memory for prepared full lists (customers without picks); `0` turns the cache off |
 | `MW_FORWARDED_PROTO` | empty | `X-Forwarded-Proto` sent to IPTV Boss when the player's proxy doesn't send one. Set `https` if IPTV Boss runs with `BEHIND_HTTPS_PROXY=true`, otherwise it answers the middleware's own calls with 426 |
 
 ## Panel API
@@ -132,14 +139,15 @@ address for both IPTV Boss's own API and this one.
 
 ### `GET /middleware/v1/health`
 
-`{"status": "ok", "version": "1.0.0", "boss": "ok"}`
+`{"status": "ok", "version": "1.1.0", "boss": "ok"}`
 
 ### `POST /middleware/v1/categories/refresh`
 
 Loads every category from IPTV Boss using one customer's login. Run it once after
 installing, and whenever you want the list current before any player has connected.
 
-Body: `{"username": "...", "password": "..."}`
+Body: `{"username": "...", "password": "...", "layout": 2}`. Send the service's layout id:
+category ids repeat across layouts, and this is what files the list under the right one.
 Answer: `{"categories": {"live": 74, "vod": 22, "series": 13}, "layout": 2}`
 
 The middleware also learns categories from players' own requests.
@@ -178,6 +186,9 @@ Send only the types you're changing.
   in the list is saved as excluded; anything added later follows the rule.
 - `null` means everything for that type.
 - `new_categories` is optional: `default` follows the server setting, or `show` / `hide`.
+- `layout` is optional but recommended: the layout the line is on, so "everything else" means that
+  layout's categories and not another's. Without it, for a line the middleware has not seen play yet,
+  the categories not listed are hidden rather than excluded.
 - For full control, send an object instead of a list:
   `{"mode": "selected", "included": [...], "excluded": [...], "new_categories": "show"}`.
 

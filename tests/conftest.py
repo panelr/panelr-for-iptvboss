@@ -61,6 +61,7 @@ def build_guide(channel_ids, extra_channel="Orphan.ch", programmes_each=3):
 GUIDE_CATEGORIES = [LIVE_CATEGORIES[0]["category_id"], LIVE_CATEGORIES[1]["category_id"],
                     LIVE_CATEGORIES[2]["category_id"]]
 GUIDE = build_guide(guide_channels_for(GUIDE_CATEGORIES))
+BIG_SHIFT = 300000 * 10000                    # pushes every id past 2,147,483,647 while keeping its layout digit
 
 
 class FakeBoss:
@@ -69,6 +70,10 @@ class FakeBoss:
     def __init__(self):
         self.extra_live_category = None     # (category row, stream row)
         self.broken = False
+        self.big_ids = False                # serve ids past 2^31-1, as a very large layout does
+        self.info_redirects = False         # answer get_vod_info / get_series_info with a 302, like IPTV Boss
+        self.guide_body = None              # a fixed xmltv answer (b"" = the empty body IPTV Boss sends mid-rewrite)
+        self.layout_shift = 0               # add this to every stream id, to fake a second layout
         self.requests = []
 
     def app(self):
@@ -101,7 +106,16 @@ class FakeBoss:
                  "get_vod_info": "get_vod_info.json", "get_series_info": "get_series_info.json", "": "login.json"}
         if action not in files:
             return web.json_response([])
+        if self.info_redirects and action in ("get_vod_info", "get_series_info"):
+            return web.Response(status=302, headers={"Location": "http://provider.example/info"})
         data = json.loads(load(files[action]))
+        if (self.big_ids or self.layout_shift) and isinstance(data, list):
+            data = copy.deepcopy(data)
+            for row in data:
+                for key in ("stream_id", "series_id"):
+                    if key in row and str(row[key]).isdigit():
+                        value = int(row[key]) + (BIG_SHIFT if self.big_ids else 0) + self.layout_shift
+                        row[key] = value if isinstance(row[key], int) else str(value)
         if self.extra_live_category and action == "get_live_categories":
             data = data + [self.extra_live_category[0]]
         if self.extra_live_category and action == "get_live_streams":
@@ -122,6 +136,8 @@ class FakeBoss:
     async def xmltv(self, request):
         if not self.authed(request):
             return web.Response(status=401)
+        if self.guide_body is not None:
+            return web.Response(body=self.guide_body, headers={"Content-Type": "application/xml"})
         if "gzip" in request.headers.get("Accept-Encoding", ""):
             return web.Response(body=gzip.compress(GUIDE), headers={"Content-Type": "application/xml",
                                                                     "Content-Encoding": "gzip"})

@@ -1,7 +1,10 @@
 """SQLite storage: the category catalogue, customer picks and settings.
 
-Category ids are IPTV Boss group ids. They are unique across layouts and
-survive renames, reorders and rebuilds, so picks are stored by id.
+Category ids are IPTV Boss group ids. They survive renames, reorders and
+rebuilds, so picks are stored by id. They are NOT unique across layouts: two
+layouts on one server can both have a group 12, so the catalogue is keyed by
+(type, layout, id). A category learned before its layout is known sits under
+UNKNOWN until a layout claims it.
 """
 import json
 import sqlite3
@@ -10,18 +13,19 @@ import time
 
 TYPES = ("live", "vod", "series")
 RULES = ("show", "hide")
+UNKNOWN = -1              # layout not known yet; never a real IPTV Boss layout id (those start at 0)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS categories (
     type        TEXT    NOT NULL,
+    layout      INTEGER NOT NULL DEFAULT -1,
     id          TEXT    NOT NULL,
     name        TEXT    NOT NULL,
     position    INTEGER NOT NULL DEFAULT 0,
-    layout      INTEGER,
     first_seen  INTEGER NOT NULL,
     last_seen   INTEGER NOT NULL,
     removed_at  INTEGER,
-    PRIMARY KEY (type, id)
+    PRIMARY KEY (type, layout, id)
 );
 CREATE TABLE IF NOT EXISTS picks (
     username      TEXT    NOT NULL,
@@ -41,17 +45,38 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 class Store:
-    def __init__(self, path, default_rule="show"):
+    def __init__(self, path, default_rule="show", grace_days=0):
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.executescript(SCHEMA)
         self._lock = threading.Lock()
+        self._migrate()
+        self._db.executescript(SCHEMA)
         self._default_rule = default_rule
+        self._grace = int(grace_days) * 86400      # 0 = a missing category is never marked removed
         self._cache = {}        # username -> {type: Picks}; cleared on every picks write
-        self.version = 0        # bumps whenever picks or settings change
+        self.version = 0        # bumps whenever picks, settings or the catalogue change
+        self.writes = 0         # catalogue writes, for tests and the health page
 
     def close(self):
         self._db.close()
+
+    def _migrate(self):
+        """1.0 keyed categories by (type, id) with a nullable layout. Re-key by (type, layout, id)."""
+        row = self._db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'categories'").fetchone()
+        if not row or "PRIMARY KEY (type, layout, id)" in row[0]:
+            return
+        with self._lock:
+            self._db.executescript("""
+                ALTER TABLE categories RENAME TO categories_v1;
+                CREATE TABLE categories (
+                    type TEXT NOT NULL, layout INTEGER NOT NULL DEFAULT -1, id TEXT NOT NULL, name TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
+                    removed_at INTEGER, PRIMARY KEY (type, layout, id));
+                INSERT OR IGNORE INTO categories(type, layout, id, name, position, first_seen, last_seen, removed_at)
+                    SELECT type, COALESCE(layout, -1), id, name, position, first_seen, last_seen, removed_at
+                    FROM categories_v1;
+                DROP TABLE categories_v1;
+            """)
 
     # ---- settings -------------------------------------------------------
 
@@ -69,10 +94,15 @@ class Store:
 
     # ---- catalogue ------------------------------------------------------
 
-    def record_categories(self, ctype, rows):
-        """Upsert the categories from a category list IPTV Boss returned."""
+    def record_categories(self, ctype, rows, layout=None):
+        """Upsert the categories from a category list IPTV Boss returned, under the layout they belong to.
+
+        With no layout they are filed under UNKNOWN and claimed later by record_layout_categories.
+        """
         now = int(time.time())
+        layout = UNKNOWN if layout is None else int(layout)
         with self._lock:
+            before = self._signature(ctype, layout)
             for pos, row in enumerate(rows):
                 if not isinstance(row, dict):
                     continue
@@ -80,47 +110,75 @@ class Store:
                 if not cid:
                     continue
                 self._db.execute(
-                    "INSERT INTO categories(type, id, name, position, first_seen, last_seen) VALUES(?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(type, id) DO UPDATE SET name = excluded.name, position = excluded.position, "
+                    "INSERT INTO categories(type, layout, id, name, position, first_seen, last_seen) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(type, layout, id) DO UPDATE SET name = excluded.name, position = excluded.position, "
                     "last_seen = excluded.last_seen, removed_at = NULL",
-                    (ctype, cid, str(row.get("category_name", "")), pos, now, now))
+                    (ctype, layout, cid, str(row.get("category_name", "")), pos, now, now))
+            self.writes += 1
+            if self._signature(ctype, layout) != before:
+                self._changed()
 
     def record_layout_categories(self, ctype, layout, category_ids, mark_removed=False):
-        """Tag categories with their layout.
+        """A layout's category ids, as seen in one of its lists.
 
-        With mark_removed, `category_ids` is the layout's complete category list,
-        so categories tagged to that layout but missing from it are marked removed.
+        Categories still filed under UNKNOWN move to this layout. With mark_removed, `category_ids`
+        is the layout's complete list: a category of that layout missing from it is marked removed
+        once it has been missing for the grace period (never, when the grace period is 0).
         """
         if layout is None:
             return
-        now = int(time.time())
+        layout, now = int(layout), int(time.time())
         present = {str(c) for c in category_ids}
         with self._lock:
+            before = self._signature(ctype, layout)
             for cid in present:
-                self._db.execute("UPDATE categories SET layout = ? WHERE type = ? AND id = ?", (layout, ctype, cid))
-            if not mark_removed:
-                return
-            known = [r[0] for r in self._db.execute(
-                "SELECT id FROM categories WHERE type = ? AND layout = ? AND removed_at IS NULL", (ctype, layout))]
-            for cid in known:
-                if cid not in present:
-                    self._db.execute("UPDATE categories SET removed_at = ? WHERE type = ? AND id = ?",
-                                     (now, ctype, cid))
+                # claim, never overwrite: a real row for this layout always wins over an UNKNOWN one
+                self._db.execute(
+                    "UPDATE categories SET layout = ? WHERE type = ? AND layout = ? AND id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM categories c WHERE c.type = ? AND c.layout = ? AND c.id = ?)",
+                    (layout, ctype, UNKNOWN, cid, ctype, layout, cid))
+                self._db.execute("UPDATE categories SET last_seen = ?, removed_at = NULL "
+                                 "WHERE type = ? AND layout = ? AND id = ?", (now, ctype, layout, cid))
+            if mark_removed and self._grace > 0:
+                self._db.execute(
+                    "UPDATE categories SET removed_at = ? WHERE type = ? AND layout = ? AND removed_at IS NULL "
+                    "AND last_seen < ? AND id NOT IN (%s)" % ",".join("?" * len(present)) if present else
+                    "UPDATE categories SET removed_at = ? WHERE type = ? AND layout = ? AND removed_at IS NULL "
+                    "AND last_seen < ?",
+                    [now, ctype, layout, now - self._grace] + sorted(present))
+            if self._signature(ctype, layout) != before:
+                self._changed()
 
     def categories(self, ctype=None, include_removed=False, layout=None):
+        """Catalogue rows. With a layout: that layout's rows, or the UNKNOWN rows while it has none yet."""
         sql = "SELECT type, id, name, position, layout, first_seen, last_seen, removed_at FROM categories"
         where, args = [], []
         if ctype:
             where.append("type = ?"); args.append(ctype)
         if layout is not None:
-            where.append("(layout = ? OR layout IS NULL)"); args.append(layout)
+            where.append("(layout = ? OR (layout = ? AND NOT EXISTS (SELECT 1 FROM categories b "
+                         "WHERE b.type = categories.type AND b.layout = ? AND b.removed_at IS NULL)))")
+            args += [int(layout), UNKNOWN, int(layout)]
         if not include_removed:
             where.append("removed_at IS NULL")
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY type, layout, position"
+        sql += " ORDER BY type, layout, position, id"
         keys = ("type", "id", "name", "position", "layout", "first_seen", "last_seen", "removed_at")
-        return [dict(zip(keys, r)) for r in self._db.execute(sql, args)]
+        out = []
+        for r in self._db.execute(sql, args):
+            row = dict(zip(keys, r))
+            if row["layout"] == UNKNOWN:
+                row["layout"] = None
+            out.append(row)
+        return out
+
+    def _signature(self, ctype, layout):
+        """What depends on a layout's catalogue: its live ids, names and order."""
+        return self._db.execute(
+            "SELECT COUNT(*), GROUP_CONCAT(id || ':' || name, '|') FROM (SELECT id, name FROM categories "
+            "WHERE type = ? AND layout = ? AND removed_at IS NULL ORDER BY position, id)", (ctype, layout)).fetchone()
 
     # ---- picks ----------------------------------------------------------
 
