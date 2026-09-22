@@ -140,6 +140,8 @@ class Store:
                     (layout, ctype, UNKNOWN, cid, ctype, layout, cid))
                 self._db.execute("UPDATE categories SET last_seen = ?, removed_at = NULL "
                                  "WHERE type = ? AND layout = ? AND id = ?", (now, ctype, layout, cid))
+                # the same id filed before its layout was known is this row's older self: drop it
+                self._db.execute("DELETE FROM categories WHERE type = ? AND layout = ? AND id = ?", (ctype, UNKNOWN, cid))
             if mark_removed and self._grace > 0:
                 self._db.execute(
                     "UPDATE categories SET removed_at = ? WHERE type = ? AND layout = ? AND removed_at IS NULL "

@@ -48,6 +48,7 @@ def test_unknown_rows_are_claimed_by_a_layout_and_never_overwrite_it(tmp_path):
     s.record_layout_categories("live", 3, ["1"])
     names = {(c["layout"], c["id"]): c["name"] for c in s.categories("live", layout=3)}
     assert names[(3, "1")] == "A on 3"                                                   # the real row won
+    assert not [c for c in s.categories("live", include_removed=True) if c["layout"] is None]   # and the unknown copy is gone
 
 
 def test_removal_needs_a_grace_period(tmp_path):
