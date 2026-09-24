@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0
+
+- **Fix: a customer created between syncs could not watch.** IPTV Boss writes each customer a
+  playlist file during a sync and answers `get.php` with 403 until that file exists, so anyone
+  added by API in between was refused, often for hours. The channels themselves are in IPTV Boss's
+  database the moment the customer is created, so when IPTV Boss refuses the playlist is built
+  from `get_live_categories` and `get_live_streams` and served straight away, in the same
+  m3u_plus layout IPTV Boss writes, in IPTV Boss's channel order, with the customer's picks
+  applied as usual. `output=m3u8` is honoured. If the channel list cannot be read, IPTV Boss's
+  own refusal is passed on unchanged, so nothing is hidden.
+
 ## 1.1.0
 
 Fixes found in production by NemosTV (thank you) and brought into the product in a

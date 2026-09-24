@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, parse_qsl, urlencode
 
 from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
-from . import __version__, idmap
+from . import __version__, idmap, playlist
 from .filters import empty_epg, filter_categories, filter_m3u, filter_panel_api, filter_rows
 from .guide import GuideStore, file_version, gzip_stream
 from .store import TYPES, Store
@@ -153,8 +153,12 @@ class Middleware:
             request["mw_body"] = urlencode(form).encode("utf-8")
         return expanded
 
-    async def proxy(self, request):
-        """Pass a request to IPTV Boss and stream the answer back unchanged."""
+    async def proxy(self, request, forbidden=None):
+        """Pass a request to IPTV Boss and stream the answer back unchanged.
+
+        `forbidden` is an optional coroutine called instead when IPTV Boss refuses the request,
+        which is how it answers for a customer whose playlist file has not been written yet.
+        """
         if "mw_body" in request:
             data = request["mw_body"]
         else:
@@ -165,6 +169,10 @@ class Middleware:
         try:
             async with self.session.request(request.method, self.upstream(request), data=data,
                                             headers=headers, allow_redirects=False) as up:
+                if up.status == 403 and forbidden is not None:
+                    built = await forbidden()
+                    if built is not None:
+                        return built
                 resp = web.StreamResponse(status=up.status, reason=up.reason)
                 for k, v in up.headers.items():
                     if k.lower() not in HOP_BY_HOP:
@@ -385,9 +393,13 @@ class Middleware:
         p = await self.params(request)
         username, password = p.get("username", ""), p.get("password", "")
         if not self.filters(username):
-            return await self.proxy(request)
+            return await self.proxy(request, forbidden=lambda: self.built_playlist(request, username, password))
         try:
             status, headers, body = await self.fetch_like(request)
+            if status == 403:
+                built = await self.built_playlist(request, username, password)
+                if built is not None:
+                    status, headers, body = 200, dict(built.headers), built.body
             text = body.decode("utf-8", "replace")
             if status != 200 or not text.lstrip().startswith("#EXTM3U"):
                 return raw_response(status, headers, body)
@@ -409,6 +421,46 @@ class Middleware:
         except Exception:
             log.exception("filtering get.php failed; sending it unfiltered")
             return await self.proxy(request)
+
+    async def built_playlist(self, request, username, password):
+        """The customer's playlist, built from IPTV Boss's channel list.
+
+        IPTV Boss writes each customer a playlist file during a sync and refuses get.php until
+        that file exists, so anyone created between syncs cannot watch. The channels themselves
+        come from the database, so the playlist is built from player_api.php instead and the
+        customer is served straight away. Returns None when that cannot be done, which leaves
+        IPTV Boss's own answer in place.
+        """
+        if not username or not password:
+            return None
+        try:
+            rows = {}
+            for key, action in (("categories", "get_live_categories"), ("streams", "get_live_streams")):
+                qs = "/player_api.php?" + urlencode({"username": username, "password": password, "action": action})
+                status, headers, body = await self.fetch("GET", qs)
+                if status != 200 or "json" not in headers.get("Content-Type", "").lower():
+                    return None
+                rows[key] = json.loads(body)
+            if not isinstance(rows["streams"], list) or not rows["streams"]:
+                return None
+            extension = "m3u8" if request.query.get("output", "ts").lower() == "m3u8" else "ts"
+            text = playlist.build(rows["categories"], rows["streams"], self.public_base(request),
+                                  username, password, extension)
+        except (asyncio.TimeoutError, OSError, ValueError):
+            log.exception("building a playlist for %s failed; leaving IPTV Boss's answer alone", username)
+            return None
+        log.info("playlist built for %s from the channel list: %d channels (IPTV Boss has no file yet)",
+                 username, len(rows["streams"]))
+        resp = web.Response(status=200, body=text.encode("utf-8"))
+        resp.headers["Content-Type"] = "audio/x-mpegurl; charset=utf-8"
+        resp.headers["Content-Disposition"] = 'attachment; filename="playlist.m3u"'
+        return resp
+
+    def public_base(self, request):
+        """The address the player used, so the URLs in the playlist come back to this server."""
+        proto = request.headers.get("X-Forwarded-Proto") or request.scheme
+        host = request.headers.get("X-Forwarded-Host") or request.headers.get("Host") or request.url.host
+        return "%s://%s" % (proto.split(",")[0].strip(), host.split(",")[0].strip())
 
     # ---- xmltv.php ----------------------------------------------------------
 

@@ -10,6 +10,23 @@ between customers' players and IPTV Boss, keeps each customer's picks, and trims
 what their player receives. Panelr tells it what each customer picked. Nothing in
 IPTV Boss changes, and it works with any IPTV Boss XC server.
 
+## A customer added between syncs
+
+IPTV Boss writes each customer their own playlist file when it syncs, and refuses `get.php`
+until that file exists. A customer created by API in between is therefore refused until the
+next sync, which may be hours away.
+
+The add-on covers that gap. When IPTV Boss refuses a playlist, the add-on builds it from the
+channel list IPTV Boss already holds for that customer and serves it. Nothing to switch on, and
+nothing changes for a customer whose file does exist: IPTV Boss's own playlist is used, byte for
+byte. A built playlist carries the same channels in the same order, honours `output=m3u8`, and
+has the customer's category picks applied like any other.
+
+Streams in a built playlist point at this server, which passes the player on to the provider,
+exactly as `player_api.php` already does.
+
+If the channel list cannot be read for any reason, IPTV Boss's refusal is passed on unchanged.
+
 ## Connect it to Panelr
 
 1. Install it on your IPTV Boss server (below) and note its `MW_API_KEY`.

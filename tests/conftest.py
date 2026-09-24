@@ -73,6 +73,7 @@ class FakeBoss:
         self.big_ids = False                # serve ids past 2^31-1, as a very large layout does
         self.info_redirects = False         # answer get_vod_info / get_series_info with a 302, like IPTV Boss
         self.guide_body = None              # a fixed xmltv answer (b"" = the empty body IPTV Boss sends mid-rewrite)
+        self.no_playlist_file = False       # refuse get.php, as IPTV Boss does before a sync has written the file
         self.layout_shift = 0               # add this to every stream id, to fake a second layout
         self.requests = []
 
@@ -129,6 +130,8 @@ class FakeBoss:
     async def get_php(self, request):
         if not self.authed(request):
             return web.Response(status=401)
+        if self.no_playlist_file:
+            return web.Response(status=403)
         return web.Response(body=load("get_m3u_plus.m3u").encode(),
                             headers={"Content-Type": "audio/x-mpegurl;charset=utf-8",
                                      "Content-Disposition": 'attachment; filename="playlist.m3u"'})
