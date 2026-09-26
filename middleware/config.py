@@ -24,6 +24,8 @@ class Config:
     forwarded_proto: str      # X-Forwarded-Proto for IPTV Boss when the player's proxy sends none: "" | http | https
     category_grace_days: int  # days a category may be missing before it is marked removed; 0 = never
     list_cache_mb: int        # memory for prepared full lists (customers without picks); 0 = off
+    busy_wait_seconds: int    # how long a player's request may wait while IPTV Boss installs a revision; 0 = off
+    redirect_cache: int       # stream redirects remembered, served while IPTV Boss is busy; 0 = off
 
     @classmethod
     def from_env(cls, env=None):
@@ -43,6 +45,12 @@ class Config:
         if grace < 0:
             raise SystemExit("MW_CATEGORY_GRACE_DAYS must be 0 (never) or a number of days")
         cache_mb = _int(env, "MW_LIST_CACHE_MB", 64)
+        busy_wait = _int(env, "MW_BUSY_WAIT_SECONDS", 100)
+        if busy_wait < 0:
+            raise SystemExit("MW_BUSY_WAIT_SECONDS must be 0 (off) or a number of seconds")
+        redirects = _int(env, "MW_REDIRECT_CACHE", 20000)
+        if redirects < 0:
+            raise SystemExit("MW_REDIRECT_CACHE must be 0 (off) or a number of entries")
         if cache_mb < 0:
             raise SystemExit("MW_LIST_CACHE_MB must be 0 (off) or a number of megabytes")
         return cls(
@@ -58,6 +66,8 @@ class Config:
             forwarded_proto=proto,
             category_grace_days=grace,
             list_cache_mb=cache_mb,
+            busy_wait_seconds=busy_wait,
+            redirect_cache=redirects,
         )
 
 

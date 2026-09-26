@@ -17,7 +17,7 @@ import zlib
 from collections import OrderedDict
 from urllib.parse import parse_qs, parse_qsl, urlencode
 
-from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
+from aiohttp import ClientConnectorError, ClientSession, ClientTimeout, TCPConnector, web
 
 from . import __version__, idmap, playlist
 from .filters import empty_epg, filter_categories, filter_m3u, filter_panel_api, filter_rows
@@ -36,6 +36,11 @@ ID_ACTIONS = set(LIST_ACTIONS) | {"get_vod_info", "get_series_info", "get_short_
 ID_PARAMS = ("stream_id", "series_id", "vod_id")
 STREAM_PATHS = {"live": "live", "movie": "vod", "series": "series"}
 MAP_MAX_AGE = 300
+# Requests from players. These may wait while IPTV Boss is busy; a panel's API calls never do.
+PLAYER_PATHS = ("/player_api.php", "/get.php", "/xmltv.php", "/panel_api.php",
+                "/live/", "/movie/", "/series/", "/timeshift/")
+BUSY_STATUSES = {503}           # what IPTV Boss answers while it installs a revision (about 80 s per desktop close)
+BUSY_BACKOFF = (0.5, 1.0, 2.0)  # seconds between tries, the last one repeated
 LIST_CACHE_MIN = 256 * 1024     # smaller lists are prepared per request; caching them buys nothing
 
 
@@ -74,6 +79,7 @@ class Middleware:
         self._lists = OrderedDict()               # (size, crc32) -> (compacted, gzipped): full lists, no picks
         self._lists_bytes = 0
         self._list_locks = {}
+        self._redirects = OrderedDict()           # (kind, username, password, tail) -> Location, served while IPTV Boss is busy
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -90,6 +96,54 @@ class Middleware:
         self.store.close()
 
     # ---- helpers --------------------------------------------------------
+
+    @staticmethod
+    def player_request(request):
+        return request.rel_url.path.startswith(PLAYER_PATHS)
+
+    async def open_upstream(self, method, url, wait, on_busy=None, **kw):
+        """Start a request to IPTV Boss, waiting through a busy spell when `wait` is set.
+
+        IPTV Boss refuses every request with 503 for about 80 seconds each time a revision is
+        installed (the desktop closing, a restore). A player that gets the 503 shows an error, so a
+        player's request is retried until IPTV Boss answers or MW_BUSY_WAIT_SECONDS runs out, in
+        which case the last answer is passed on unchanged. `on_busy`, if given, is called once on
+        the first refusal and may return a web.Response to send instead of waiting.
+        Returns a ClientResponse the caller must release, or the web.Response from `on_busy`.
+        """
+        limit = self.config.busy_wait_seconds if wait else 0
+        started = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                up = await self.session.request(method, url, **kw)
+            except ClientConnectorError:
+                if time.monotonic() - started >= limit:
+                    raise
+                up = None
+            if up is not None and up.status not in BUSY_STATUSES:
+                if attempt:
+                    log.info("IPTV Boss was busy for %.0f s; %s answered after %d tries", time.monotonic() - started,
+                             url.split("?")[0], attempt + 1)
+                return up
+            if attempt == 0 and on_busy is not None:
+                alt = on_busy()
+                if alt is not None:
+                    if up is not None:
+                        up.release()
+                    return alt
+            if time.monotonic() - started >= limit:
+                if attempt:
+                    log.warning("IPTV Boss still busy after %.0f s; passing its answer on for %s",
+                                time.monotonic() - started, url.split("?")[0])
+                if up is None:
+                    raise OSError("IPTV Boss is not accepting connections")
+                return up
+            if up is not None:
+                up.release()
+            await asyncio.sleep(min(BUSY_BACKOFF[min(attempt, len(BUSY_BACKOFF) - 1)],
+                                    max(0.0, limit - (time.monotonic() - started))))
+            attempt += 1
 
     @staticmethod
     def path_qs(request):
@@ -153,11 +207,13 @@ class Middleware:
             request["mw_body"] = urlencode(form).encode("utf-8")
         return expanded
 
-    async def proxy(self, request, forbidden=None):
+    async def proxy(self, request, forbidden=None, on_busy=None, seen=None):
         """Pass a request to IPTV Boss and stream the answer back unchanged.
 
         `forbidden` is an optional coroutine called instead when IPTV Boss refuses the request,
         which is how it answers for a customer whose playlist file has not been written yet.
+        `on_busy` may supply an answer while IPTV Boss is busy (see open_upstream); `seen` is
+        told the status and headers of every answer that arrives from IPTV Boss.
         """
         if "mw_body" in request:
             data = request["mw_body"]
@@ -167,8 +223,13 @@ class Middleware:
         if "mw_body" not in request and request.content_length is not None:
             headers["Content-Length"] = str(request.content_length)  # keep the size; IPTVBoss rejects uploads without it
         try:
-            async with self.session.request(request.method, self.upstream(request), data=data,
-                                            headers=headers, allow_redirects=False) as up:
+            up = await self.open_upstream(request.method, self.upstream(request), self.player_request(request),
+                                          on_busy=on_busy, data=data, headers=headers, allow_redirects=False)
+            if isinstance(up, web.Response):
+                return up
+            try:
+                if seen is not None:
+                    seen(up.status, up.headers)
                 if up.status == 403 and forbidden is not None:
                     built = await forbidden()
                     if built is not None:
@@ -182,6 +243,8 @@ class Middleware:
                     await resp.write(chunk)
                 await resp.write_eof()
                 return resp
+            finally:
+                up.release()
         except (asyncio.TimeoutError, OSError) as e:
             log.warning("IPTV Boss did not answer %s: %s", request.rel_url.path, e)
             return web.Response(status=502, text="Upstream unavailable")
@@ -201,22 +264,29 @@ class Middleware:
             return raw_response(status, headers, idmap.compact_json(body))
         return passthrough_response(status, headers, body)
 
-    async def fetch(self, method, path_qs, headers=None, data=None):
-        """Fetch from IPTV Boss uncompressed. Returns (status, headers, body bytes)."""
+    async def fetch(self, method, path_qs, headers=None, data=None, wait=False):
+        """Fetch from IPTV Boss uncompressed. Returns (status, headers, body bytes).
+
+        With `wait`, a busy IPTV Boss is waited for (open_upstream); calls made on the
+        middleware's own behalf leave it off and fail open as before.
+        """
         headers = dict(headers or {})
         headers.pop("Accept-Encoding", None)
         headers["Accept-Encoding"] = "identity"
-        async with self.session.request(method, self.config.boss_url + path_qs, headers=headers, data=data,
-                                        allow_redirects=False) as up:
+        up = await self.open_upstream(method, self.config.boss_url + path_qs, wait, headers=headers, data=data,
+                                      allow_redirects=False)
+        try:
             body = await up.read()
             if up.headers.get("Content-Encoding", "").lower() == "gzip":
                 body = zlib.decompress(body, wbits=31)
             return up.status, up.headers, body
+        finally:
+            up.release()
 
     async def fetch_like(self, request):
         """Repeat the player's own request against IPTV Boss, uncompressed."""
         return await self.fetch(request.method, self.path_qs(request), self.forward_headers(request, True),
-                                request.get("mw_body"))
+                                request.get("mw_body"), wait=self.player_request(request))
 
     async def ensure_map(self, ctype, username, password, layout=None):
         """Make sure the stream map for a customer's layout is loaded and recent. Returns the layout."""
@@ -573,7 +643,26 @@ class Middleware:
                 allows = self.allows_fn(username)
                 if not any(allows(ctype, c) for c in cats):
                     return web.Response(status=403, text="Not in your package")
-        return await self.proxy(request)
+        # IPTV Boss answers a stream with a redirect to the provider that does not change between
+        # revisions, so the last one seen is served while IPTV Boss is busy instead of waiting.
+        key = (kind, username, request.match_info.get("password", ""), tail)
+
+        def on_busy():
+            location = self._redirects.get(key)
+            if location is None:
+                return None
+            self._redirects.move_to_end(key)
+            log.info("IPTV Boss busy; %s served from the remembered redirect", request.rel_url.path)
+            return web.Response(status=302, headers={"Location": location})
+
+        def seen(status, headers):
+            if status in (301, 302, 307, 308) and headers.get("Location") and self.config.redirect_cache:
+                self._redirects[key] = headers["Location"]
+                self._redirects.move_to_end(key)
+                while len(self._redirects) > self.config.redirect_cache:
+                    self._redirects.popitem(last=False)
+
+        return await self.proxy(request, on_busy=on_busy, seen=seen)
 
     # ---- panel API ----------------------------------------------------------
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.3.0
+
+- **Fix: every desktop close cut customers off for about 80 seconds.** IPTV Boss refuses every
+  request with 503 while it installs a revision, which happens each time the desktop app closes
+  (and on a restore). Players showed an error or failed to start a channel. A player's request now
+  waits for IPTV Boss instead, for up to `MW_BUSY_WAIT_SECONDS` (default 100), and only then is
+  the refusal passed on. Stream starts do not even wait: the redirect IPTV Boss last gave for that
+  channel or movie is remembered (`MW_REDIRECT_CACHE` entries, default 20000) and served at once,
+  so a channel opens during the install exactly as it did before. A panel's own API calls
+  (`/api/v1/...`) never wait; a panel already retries those.
+
 ## 1.2.0
 
 - **Fix: a customer created between syncs could not watch.** IPTV Boss writes each customer a

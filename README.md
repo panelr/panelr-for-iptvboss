@@ -146,6 +146,8 @@ IPTV Boss's data.
 | `MW_FORWARDED_PROTO` | empty | `https` when IPTV Boss runs with `BEHIND_HTTPS_PROXY=true` and no proxy sets `X-Forwarded-Proto` |
 | `MW_CATEGORY_GRACE_DAYS` | `0` | Days a category may be missing before it is marked removed; `0` never marks one removed |
 | `MW_LIST_CACHE_MB` | `64` | Memory for prepared full lists (customers without picks); `0` turns the cache off |
+| `MW_BUSY_WAIT_SECONDS` | `100` | How long a player's request may wait while IPTV Boss installs a revision (each desktop close); `0` passes the refusal on at once |
+| `MW_REDIRECT_CACHE` | `20000` | Stream redirects remembered and served while IPTV Boss is busy; `0` turns it off |
 | `MW_FORWARDED_PROTO` | empty | `X-Forwarded-Proto` sent to IPTV Boss when the player's proxy doesn't send one. Set `https` if IPTV Boss runs with `BEHIND_HTTPS_PROXY=true`, otherwise it answers the middleware's own calls with 426 |
 
 ## Panel API

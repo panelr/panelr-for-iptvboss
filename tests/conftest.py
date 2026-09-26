@@ -3,6 +3,7 @@ import copy
 import gzip
 import json
 import os
+import time
 import sys
 
 import pytest
@@ -75,6 +76,8 @@ class FakeBoss:
         self.guide_body = None              # a fixed xmltv answer (b"" = the empty body IPTV Boss sends mid-rewrite)
         self.no_playlist_file = False       # refuse get.php, as IPTV Boss does before a sync has written the file
         self.layout_shift = 0               # add this to every stream id, to fake a second layout
+        self.busy_until = 0.0               # monotonic time until which every answer is 503, as during a promotion
+        self.busy_hits = 0
         self.requests = []
 
     def app(self):
@@ -88,11 +91,21 @@ class FakeBoss:
         app.router.add_route("*", "/boss.php/cloud/v1/{tail:.*}", self.cloud)
         return app
 
+    def busy(self):
+        """The 503 IPTV Boss gives while it installs a revision, or None."""
+        if time.monotonic() < self.busy_until:
+            self.busy_hits += 1
+            return web.Response(status=503, text="XC Server is busy. Retry shortly.")
+        return None
+
     def authed(self, request, form=None):
         q = form or request.query
         return q.get("username") == USER and q.get("password") == PASSWORD
 
     async def player_api(self, request):
+        busy = self.busy()
+        if busy is not None:
+            return busy
         form = await request.post() if request.method == "POST" else None
         self.requests.append(("player_api", dict(form or request.query)))
         if not self.authed(request, form):
@@ -128,6 +141,9 @@ class FakeBoss:
         return web.Response(body=body.encode(), headers={"Content-Type": "application/json;charset=utf-8"})
 
     async def get_php(self, request):
+        busy = self.busy()
+        if busy is not None:
+            return busy
         if not self.authed(request):
             return web.Response(status=401)
         if self.no_playlist_file:
@@ -152,9 +168,15 @@ class FakeBoss:
         return web.Response(body=load("panel_api.json").encode(), headers={"Content-Type": "application/json"})
 
     async def stream(self, request):
+        busy = self.busy()
+        if busy is not None:
+            return busy
         return web.Response(status=302, headers={"Location": f"http://provider.example/{request.match_info['file']}"})
 
     async def api_users(self, request):
+        busy = self.busy()
+        if busy is not None:
+            return busy
         return web.json_response({"items": [], "from": "boss"})
 
     async def cloud(self, request):
