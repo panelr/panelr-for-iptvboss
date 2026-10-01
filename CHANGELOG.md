@@ -1,5 +1,47 @@
 # Changelog
 
+## 1.4.1
+
+### Fixed
+- **Apps showed old or no listings for a channel while the full guide was fine.**
+  IPTV Boss answers per-channel guide requests (`get_short_epg`, `get_simple_data_table`)
+  from a separate programmes database that it only rebuilds while **Universal EPG** output
+  is switched on. With Universal EPG off, those answers froze at the last rebuild and ran
+  out within days on every channel. Apps that download the whole guide were unaffected.
+
+  The middleware now answers these requests from the current guide, which it already keeps
+  split per channel. The format matches IPTV Boss exactly: UTC times, base64 title and
+  description, 4 listings by default, and `now_playing` in the table. Listings are as current
+  as the guide, sports event channels included, and customers' picks still apply.
+
+  Once the guide is loaded it is the only source: a channel the guide doesn't carry, or
+  with nothing current, gets an empty listing, exactly as an app reading the whole guide
+  shows it. IPTV Boss's own (frozen) answer is only used in the first moments after a start,
+  before the guide has loaded. App requests never wait for a guide download. Every listing
+  carries `epg_id` `"0"`, so a panel can tell these answers from IPTV Boss's.
+- **Layout 0 ignored customers' category picks for the guide and for starting channels.**
+  IPTV Boss numbers layouts from 0, but ids on layout 0 (ending in `0000`) were read as
+  "no layout". Channel and category lists were already filtered correctly, but a customer
+  with picks on layout 0 downloaded the whole guide, and a channel outside their picks still
+  started if their player asked for it. Layout 0 is now handled like every other layout.
+  Customers without picks are unaffected.
+
+### Added
+- **`POST /middleware/v1/guides/refresh`** (panel key required): load the new guides now.
+  Call it when a sync finishes so listings switch to the new guide immediately; the
+  background check (`MW_EPG_RECHECK_SECONDS`) is the fallback.
+
+### Improved
+- **Lighter guide checks.** The middleware fingerprints the compressed guide as it arrives
+  and only unpacks and re-splits it when it has changed, so an unchanged guide (even a large
+  one) costs almost nothing to check.
+
+### New settings
+| Setting | Default | Purpose |
+|---|---|---|
+| `MW_EPG_FROM_GUIDE` | `true` | Answer per-channel guide requests from the current guide. `false` leaves them to IPTV Boss. |
+| `MW_EPG_RECHECK_SECONDS` | `300` | How often the guide behind those answers is checked for a newer one (in the background). |
+
 ## 1.3.0
 
 - **Fix: every desktop close cut customers off for about 80 seconds.** IPTV Boss refuses every

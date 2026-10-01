@@ -26,6 +26,8 @@ class Config:
     list_cache_mb: int        # memory for prepared full lists (customers without picks); 0 = off
     busy_wait_seconds: int    # how long a player's request may wait while IPTV Boss installs a revision; 0 = off
     redirect_cache: int       # stream redirects remembered, served while IPTV Boss is busy; 0 = off
+    epg_from_guide: bool      # answer get_short_epg / get_simple_data_table from the current guide
+    epg_recheck_seconds: int  # how often the guide behind those answers is checked for a newer one
 
     @classmethod
     def from_env(cls, env=None):
@@ -51,6 +53,9 @@ class Config:
         redirects = _int(env, "MW_REDIRECT_CACHE", 20000)
         if redirects < 0:
             raise SystemExit("MW_REDIRECT_CACHE must be 0 (off) or a number of entries")
+        epg_recheck = _int(env, "MW_EPG_RECHECK_SECONDS", 300)
+        if epg_recheck < 0:
+            raise SystemExit("MW_EPG_RECHECK_SECONDS must be a number of seconds")
         if cache_mb < 0:
             raise SystemExit("MW_LIST_CACHE_MB must be 0 (off) or a number of megabytes")
         return cls(
@@ -68,7 +73,16 @@ class Config:
             list_cache_mb=cache_mb,
             busy_wait_seconds=busy_wait,
             redirect_cache=redirects,
+            epg_from_guide=_bool_env(env, "MW_EPG_FROM_GUIDE", True),
+            epg_recheck_seconds=epg_recheck,
         )
+
+
+def _bool_env(env, name, default):
+    value = env.get(name)
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _int(env, name, default):

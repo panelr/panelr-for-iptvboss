@@ -6,6 +6,7 @@ unfiltered answer is sent, so the middleware can show a customer too much
 but never breaks their player.
 """
 import asyncio
+import base64
 import gzip
 import hmac
 import json
@@ -23,7 +24,7 @@ from . import __version__, idmap, playlist
 from .filters import empty_epg, filter_categories, filter_m3u, filter_panel_api, filter_rows
 from .guide import GuideStore, file_version, gzip_stream
 from .store import TYPES, Store
-from .streams import StreamIndex, layout_of
+from .streams import StreamIndex, guide_layout, layout_of
 
 log = logging.getLogger("middleware")
 
@@ -34,6 +35,8 @@ LIST_ACTIONS = {"get_live_streams": "live", "get_vod_streams": "vod", "get_serie
 # Answers that carry stream or series ids: they are kept inside 32 bits for players (idmap.py).
 ID_ACTIONS = set(LIST_ACTIONS) | {"get_vod_info", "get_series_info", "get_short_epg", "get_simple_data_table"}
 ID_PARAMS = ("stream_id", "series_id", "vod_id")
+EPG_ACTIONS = ("get_short_epg", "get_simple_data_table")
+SHORT_EPG_DEFAULT = 4           # listings get_short_epg sends when the player gives no limit, as IPTV Boss does
 STREAM_PATHS = {"live": "live", "movie": "vod", "series": "series"}
 MAP_MAX_AGE = 300
 # Requests from players. These may wait while IPTV Boss is busy; a panel's API calls never do.
@@ -74,6 +77,8 @@ class Middleware:
         self.guides = GuideStore(config.data_dir)
         self.session = None
         self._guide_locks = {}
+        self._guide_refresh = {}                  # layout -> background task bringing its guide up to date
+        self._guide_logins = {}                   # layout -> a login that can download its guide (for refreshes)
         self._map_locks = {}
         self._recorded = set()                    # (type, layout, size, crc32) already written to the store
         self._lists = OrderedDict()               # (size, crc32) -> (compacted, gzipped): full lists, no picks
@@ -290,13 +295,15 @@ class Middleware:
 
     async def ensure_map(self, ctype, username, password, layout=None):
         """Make sure the stream map for a customer's layout is loaded and recent. Returns the layout."""
-        layout = layout or self.streams.layout_for_user(username)
-        if layout and self.streams.is_fresh(ctype, layout, MAP_MAX_AGE):
+        if layout is None:
+            layout = self.streams.layout_for_user(username)
+        if layout is not None and self.streams.is_fresh(ctype, layout, MAP_MAX_AGE):
             return layout
-        lock = self._map_locks.setdefault((ctype, layout or username), asyncio.Lock())
+        lock = self._map_locks.setdefault((ctype, layout if layout is not None else username), asyncio.Lock())
         async with lock:
-            layout = layout or self.streams.layout_for_user(username)
-            if layout and self.streams.is_fresh(ctype, layout, MAP_MAX_AGE):
+            if layout is None:
+                layout = self.streams.layout_for_user(username)
+            if layout is not None and self.streams.is_fresh(ctype, layout, MAP_MAX_AGE):
                 return layout
             action = {"live": "get_live_streams", "vod": "get_vod_streams", "series": "get_series"}[ctype]
             qs = "/player_api.php?" + urlencode({"username": username, "password": password, "action": action})
@@ -306,7 +313,7 @@ class Middleware:
             found = self.streams.update(ctype, json.loads(body), username)
             if found:
                 self.store.record_layout_categories(ctype, found, self.streams.layout_categories(ctype, found))
-            return found or layout
+            return found if found is not None else layout
 
     def record_categories(self, ctype, layout, body, rows):
         """Write a category list to the catalogue once per distinct answer."""
@@ -314,7 +321,7 @@ class Middleware:
         if seen in self._recorded:
             return
         self.store.record_categories(ctype, rows, layout)
-        if layout:
+        if layout is not None:
             self.store.record_layout_categories(
                 ctype, layout, [r.get("category_id") for r in rows if isinstance(r, dict)], mark_removed=True)
         if len(self._recorded) > 512:
@@ -363,6 +370,14 @@ class Middleware:
     async def player_api(self, request):
         p = self.expand_ids(request, await self.params(request))
         username, action = p.get("username", ""), p.get("action", "")
+        if action in EPG_ACTIONS and username and self.config.epg_from_guide:
+            try:
+                answer = await self.guide_epg(p, action)
+            except Exception:
+                log.exception("answering %s from the guide failed; asking IPTV Boss", action)
+                answer = None
+            if answer is not None:
+                return answer
         watched = action in CATEGORY_ACTIONS or action in LIST_ACTIONS
         plain = self.proxy_ids if action in ID_ACTIONS else self.proxy
         if not username or (not watched and not self.filters(username)):
@@ -401,7 +416,7 @@ class Middleware:
             category = p.get("category_id")
             if category in (None, "") and isinstance(rows, list):
                 layout = self.streams.update(ctype, rows, username)
-                if layout:
+                if layout is not None:
                     self.store.record_layout_categories(ctype, layout, self.streams.layout_categories(ctype, layout))
             if category not in (None, "") and not allows(ctype, category):
                 return json_response([])
@@ -425,6 +440,101 @@ class Middleware:
         if action in ID_ACTIONS:
             return await self.proxy_ids(request)
         return await self.proxy(request)
+
+    # ---- per-channel guide (get_short_epg, get_simple_data_table) -----------
+
+    async def guide_epg(self, p, action):
+        """A channel's listings from the current guide, in IPTV Boss's own format, or None to ask IPTV Boss.
+
+        IPTV Boss answers these from a separate programmes database that it only rebuilds while
+        "Universal EPG" output is on, so with that off its answers are frozen at the last rebuild
+        and can list events that are not on. The guide players download is rebuilt at every sync
+        and already split per channel here, so once it is loaded the answer always comes from it:
+        a channel the guide does not carry, or with nothing current, gets an empty listing, exactly
+        as a player reading the whole guide would show. IPTV Boss is only asked before the guide
+        has loaded (just after a start) or when the channel list cannot be read.
+
+        Every listing carries epg_id "0". Panelr relies on that mark to tell these answers from
+        IPTV Boss's (whose epg_id is its guide source number), so it must not change.
+        """
+        username, password = p.get("username", ""), p.get("password", "")
+        stream_id = str(p.get("stream_id", ""))
+        layout = guide_layout(stream_id)
+        if layout is None:
+            return None
+        if self.filters(username, "live") and not await self.item_allowed("live", stream_id, username, password,
+                                                                          self.allows_fn(username)):
+            return json_response(empty_epg())
+        epg = self.streams.epg_of(stream_id)
+        if not epg and not self.streams.epg_fresh(layout, MAP_MAX_AGE):
+            # Not read yet, or a channel added since: the list is read again at most every MAP_MAX_AGE.
+            await self.load_epg_ids(layout, username, password)
+            epg = self.streams.epg_of(stream_id)
+        if epg is None:
+            return None
+        index = self.fresh_guide(layout, username, password)
+        if index is None:
+            return None
+        if not epg or not index.has(epg):
+            return json_response(empty_epg())
+        loop = asyncio.get_running_loop()
+        programmes = await loop.run_in_executor(None, index.programmes, epg)
+        now = time.time()
+        if action == "get_short_epg":
+            try:
+                limit = max(1, min(int(p.get("limit") or SHORT_EPG_DEFAULT), 500))
+            except ValueError:
+                limit = SHORT_EPG_DEFAULT
+            chosen = [x for x in programmes if x["stop"] > now][:limit]
+        else:
+            chosen = programmes
+        return json_response({"epg_listings": [epg_listing(epg, x, action, now) for x in chosen]})
+
+    async def load_epg_ids(self, layout, username, password):
+        """Read the customer's live list so every stream's guide id is known (layout 0 included)."""
+        lock = self._map_locks.setdefault(("epg", layout), asyncio.Lock())
+        async with lock:
+            if self.streams.epg_fresh(layout, MAP_MAX_AGE):
+                return
+            qs = "/player_api.php?" + urlencode({"username": username, "password": password,
+                                                 "action": "get_live_streams"})
+            status, _, body = await self.fetch("GET", qs)
+            if status == 200:
+                self.streams.update("live", json.loads(body), username)
+
+    def fresh_guide(self, layout, username, password):
+        """The layout's current guide index, without waiting. A check for a newer guide runs in the
+        background when the last one is older than MW_EPG_RECHECK_SECONDS (or none is loaded yet)."""
+        if username and password:
+            self._guide_logins[layout] = (username, password)
+        index = self.guides.get(layout)
+        if index is not None and self.guides.checked_recently(layout, self.config.epg_recheck_seconds):
+            return index
+        task = self._guide_refresh.get(layout)
+        if task is None or task.done():
+            self._guide_refresh[layout] = asyncio.create_task(self._refresh_guide(layout, username, password))
+        return index
+
+    def refresh_guides(self):
+        """Check every guide in use for a newer one now (called right after a sync). Returns the layouts."""
+        started = []
+        for layout, (username, password) in list(self._guide_logins.items()):
+            self.guides.forget_checked(layout)
+            task = self._guide_refresh.get(layout)
+            if task is None or task.done():
+                self._guide_refresh[layout] = asyncio.create_task(self._refresh_guide(layout, username, password))
+            started.append(layout)
+        return started
+
+    async def api_guides_refresh(self, request):
+        """POST /middleware/v1/guides/refresh: a sync has finished, load the new guides now."""
+        return json_response({"refreshing": sorted(self.refresh_guides())})
+
+    async def _refresh_guide(self, layout, username, password):
+        try:
+            await self.ensure_guide(layout, username, password, recheck=self.config.epg_recheck_seconds)
+        except Exception:
+            log.exception("refreshing the guide for layout %s failed", layout)
 
     @staticmethod
     def json_ids(data):
@@ -541,7 +651,9 @@ class Middleware:
             return await self.proxy(request)
         try:
             layout = await self.ensure_map("live", username, password)
-            index = await self.ensure_guide(layout, username, password) if layout else None
+            if layout is not None:
+                self._guide_logins[layout] = (username, password)
+            index = await self.ensure_guide(layout, username, password) if layout is not None else None
             allows = self.allows_fn(username)
             channels = self.streams.epg_channels(layout, lambda cid: allows("live", cid)) if index else None
             if channels is None:
@@ -571,22 +683,23 @@ class Middleware:
         await resp.write_eof()
         return resp
 
-    async def ensure_guide(self, layout, username, password):
+    async def ensure_guide(self, layout, username, password, recheck=None):
         """Rebuild the layout's guide index when IPTV Boss's guide has changed.
 
         While one request rebuilds, the others keep using the index that is already there. A
         download that is not a whole guide (IPTV Boss answers with an empty body while it is
         writing a new file) is thrown away and the current index stays.
         """
+        recheck = self.config.guide_recheck_seconds if recheck is None else recheck
         index = self.guides.get(layout)
-        if index and self.guides.checked_recently(layout, self.config.guide_recheck_seconds):
+        if index and self.guides.checked_recently(layout, recheck):
             return index
         lock = self._guide_locks.setdefault(layout, asyncio.Lock())
         if lock.locked() and index:
             return index
         async with lock:
             index = self.guides.get(layout)
-            if index and self.guides.checked_recently(layout, self.config.guide_recheck_seconds):
+            if index and self.guides.checked_recently(layout, recheck):
                 return index
             spool = self.guides.spool()
             raw_path, xml_path = spool.name, spool.name + ".xml"
@@ -600,14 +713,17 @@ class Middleware:
                         spool.write(chunk)
                 spool.close()
                 loop = asyncio.get_running_loop()
+                # Fingerprint what arrived (usually IPTV Boss's stored .gz, a tenth of the guide), so an
+                # unchanged guide is never unpacked or split again; a big one is hundreds of megabytes.
+                version = await loop.run_in_executor(None, file_version, raw_path)
+                if index and index.version == version:
+                    self.guides.mark_checked(layout)
+                    return index
                 await loop.run_in_executor(None, _unpack, raw_path, xml_path, compressed)
                 if not await loop.run_in_executor(None, _whole_guide, xml_path):
                     log.warning("IPTV Boss sent an incomplete guide for layout %s; keeping the current one", layout)
                     return index
-                version = await loop.run_in_executor(None, file_version, xml_path)
                 self.guides.mark_checked(layout)
-                if index and index.version == version:
-                    return index
                 started = time.time()
                 index = await loop.run_in_executor(None, self.guides.install, layout, xml_path, version)
                 log.info("guide for layout %s rebuilt: %d channels in %.1fs", layout, len(index.order),
@@ -813,6 +929,26 @@ class Middleware:
         return await self.proxy(request)
 
 
+def epg_listing(channel_id, x, action, now):
+    """One listing as IPTV Boss writes it: UTC times, title and description base64-encoded."""
+    def stamp(t):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(t))
+
+    def b64(text):
+        return base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+
+    row = {"id": zlib.crc32(("%s|%d" % (channel_id, x["start"])).encode("utf-8")) & 0x7FFFFFFF,
+           "epg_id": "0", "channel_id": channel_id, "start": stamp(x["start"]), "end": stamp(x["stop"]),
+           "lang": x["lang"], "title": b64(x["title"]), "description": b64(x["desc"]),
+           "start_timestamp": x["start"], "stop_timestamp": x["stop"]}
+    if action == "get_short_epg":
+        row["stop"] = stamp(x["stop"])
+    else:
+        row["now_playing"] = 1 if x["start"] <= now < x["stop"] else 0
+        row["has_archive"] = 0
+    return row
+
+
 def _unpack(raw_path, xml_path, compressed):
     if not compressed:
         os.replace(raw_path, xml_path)
@@ -872,6 +1008,7 @@ def create_app(config):
     r.add_post("/middleware/v1/categories/refresh", mw.api_refresh)
     r.add_route("*", "/middleware/v1/users/{username}/picks", mw.api_picks)
     r.add_post("/middleware/v1/users/{username}/rename", mw.api_rename)
+    r.add_post("/middleware/v1/guides/refresh", mw.api_guides_refresh)
     r.add_route("*", "/player_api.php", mw.player_api)
     r.add_route("*", "/panel_api.php", mw.panel_api)
     r.add_route("*", "/get.php", mw.get_php)

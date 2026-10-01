@@ -148,6 +148,8 @@ IPTV Boss's data.
 | `MW_LIST_CACHE_MB` | `64` | Memory for prepared full lists (customers without picks); `0` turns the cache off |
 | `MW_BUSY_WAIT_SECONDS` | `100` | How long a player's request may wait while IPTV Boss installs a revision (each desktop close); `0` passes the refusal on at once |
 | `MW_REDIRECT_CACHE` | `20000` | Stream redirects remembered and served while IPTV Boss is busy; `0` turns it off |
+| `MW_EPG_FROM_GUIDE` | `true` | Answer apps' per-channel guide requests (`get_short_epg`, `get_simple_data_table`) from the current guide instead of IPTV Boss's programmes database, which only updates while Universal EPG is on |
+| `MW_EPG_RECHECK_SECONDS` | `300` | How often the guide behind those answers is checked for a newer one (in the background; apps never wait). A server can also call `POST /middleware/v1/guides/refresh` right after each sync |
 | `MW_FORWARDED_PROTO` | empty | `X-Forwarded-Proto` sent to IPTV Boss when the player's proxy doesn't send one. Set `https` if IPTV Boss runs with `BEHIND_HTTPS_PROXY=true`, otherwise it answers the middleware's own calls with 426 |
 
 ## Panel API

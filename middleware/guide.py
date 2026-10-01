@@ -7,6 +7,7 @@ is compressed on the fly as one gzip stream (some players reject gzip made of
 several joined members). A channel is sent once even if several picked
 categories contain it.
 """
+import calendar
 import hashlib
 import html
 import json
@@ -18,9 +19,11 @@ import tempfile
 import threading
 import time
 import zlib
+from xml.etree import ElementTree
 
 CHANNEL_OPEN = re.compile(rb"<channel\b[^>]*?\bid=\"([^\"]+)\"")
 PROGRAMME_CHANNEL = re.compile(rb"\bchannel=\"([^\"]+)\"")
+XMLTV_TIME = re.compile(r"^\s*(\d{14}|\d{12})\s*(?:([+-])(\d{2}):?(\d{2}))?")
 TAIL = b"</tv>\n"
 
 
@@ -37,9 +40,33 @@ class GuideIndex:
         self.ranges = meta["ranges"]            # channel id -> [c_off, c_len, p_off, p_len]
         with open(os.path.join(folder, "head.xml"), "rb") as f:
             self.head = f.read()
+        self._programmes = {}                   # channel id -> parsed programmes, filled as players ask
 
     def channels(self):
         return list(self.order)
+
+    def has(self, channel_id):
+        return channel_id in self.ranges
+
+    def programmes(self, channel_id):
+        """One channel's programmes in guide order: dicts with start/stop (epoch seconds), title, desc, lang.
+
+        Read from the split guide and parsed once per guide version; [] when the channel has none.
+        """
+        cached = self._programmes.get(channel_id)
+        if cached is not None:
+            return cached
+        span = self.ranges.get(channel_id)
+        if not span or not span[3]:
+            return []
+        with open(os.path.join(self.folder, "programmes.xml"), "rb") as f:
+            f.seek(span[2])
+            raw = f.read(span[3])
+        parsed = parse_programmes(raw)
+        if len(self._programmes) > 20000:
+            self._programmes.clear()
+        self._programmes[channel_id] = parsed
+        return parsed
 
     def chunks(self, channel_ids, chunk_size=1 << 20):
         """Yield the uncompressed guide for these channels, in the order given. Unknown ids are skipped."""
@@ -50,6 +77,46 @@ class GuideIndex:
         with open(os.path.join(self.folder, "programmes.xml"), "rb") as f:
             yield from _ranges(f, [(self.ranges[c][2], self.ranges[c][3]) for c in wanted], chunk_size)
         yield TAIL
+
+
+def xmltv_time(value):
+    """Epoch seconds for an XMLTV time ("20261001174600 +0000"; offset and seconds optional), or None."""
+    m = XMLTV_TIME.match(value or "")
+    if not m:
+        return None
+    digits, sign, hh, mm = m.groups()
+    digits = (digits + "00")[:14] if len(digits) == 12 else digits
+    try:
+        t = calendar.timegm(time.strptime(digits, "%Y%m%d%H%M%S"))
+    except ValueError:
+        return None
+    if sign:
+        offset = int(hh) * 3600 + int(mm) * 60
+        t -= offset if sign == "+" else -offset
+    return t
+
+
+def parse_programmes(raw):
+    """Programme dicts from a run of <programme> elements (one channel's span of the split guide)."""
+    try:
+        root = ElementTree.fromstring(b"<r>" + raw + b"</r>")
+    except ElementTree.ParseError:
+        # A stray entity in one programme should not cost the channel its listings.
+        root = ElementTree.fromstring(b"<r>" + re.sub(rb"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)",
+                                                       b"&amp;", raw) + b"</r>")
+    out = []
+    for p in root.iter("programme"):
+        start, stop = xmltv_time(p.get("start")), xmltv_time(p.get("stop"))
+        if start is None or stop is None:
+            continue
+        title = p.find("title")
+        desc = p.find("desc")
+        out.append({"start": start, "stop": stop,
+                    "title": (title.text or "") if title is not None else "",
+                    "desc": (desc.text or "") if desc is not None else "",
+                    "lang": title.get("lang") if title is not None else None})
+    out.sort(key=lambda x: x["start"])
+    return out
 
 
 def _ranges(f, spans, chunk_size):
@@ -197,6 +264,9 @@ class GuideStore:
 
     def mark_checked(self, layout):
         self._checked[layout] = time.time()
+
+    def forget_checked(self, layout):
+        self._checked.pop(layout, None)
 
     def spool(self):
         """A temp file in the data folder for downloading a guide."""

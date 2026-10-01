@@ -258,3 +258,46 @@ async def test_forwarded_proto_setting(aiohttp_server, aiohttp_client, boss, tmp
         assert boss.last_cloud()["forwarded_proto"] == expected
         await client.get("/boss.php/cloud/v1/status", headers={"X-Forwarded-Proto": "http"})
         assert boss.last_cloud()["forwarded_proto"] == "http"     # the player's proxy wins
+
+
+# ---- layout 0 (a real layout: ids end in 0000) ------------------------------------
+
+def _layout_zero(mw):
+    shift = -(int(LIVE_STREAMS[0]["stream_id"]) % 10000)
+    mw.boss.layout_shift = shift
+    return shift
+
+
+async def test_layout_zero_guide_contains_only_picked_channels(mw):
+    _layout_zero(mw)
+    await refresh(mw)
+    chosen = GUIDE_CATEGORIES[1]
+    await pick(mw, {"live": [chosen]})
+    expected = guide_channels_for([chosen])
+    r = await mw.get(f"/xmltv.php?{Q}", headers={"Accept-Encoding": "identity"})
+    tree = ET.fromstring(await r.read())
+    assert [c.get("id") for c in tree.findall("channel")] == expected
+
+
+async def test_layout_zero_streams_outside_picks_are_refused(mw):
+    shift = _layout_zero(mw)
+    await refresh(mw)
+    first = LIVE_CATEGORIES[0]["category_id"]
+    await pick(mw, {"live": [first]})
+    await mw.get(f"/player_api.php?{Q}&action=get_live_streams")
+    inside = int(next(s for s in LIVE_STREAMS if s["category_id"] == first)["stream_id"]) + shift
+    outside = int(next(s for s in LIVE_STREAMS if s["category_id"] != first)["stream_id"]) + shift
+    assert inside % 10000 == 0 and outside % 10000 == 0
+    ok = await mw.get(f"/live/{USER}/{PASSWORD}/{inside}.ts", allow_redirects=False)
+    assert ok.status == 302
+    refused = await mw.get(f"/live/{USER}/{PASSWORD}/{outside}.ts", allow_redirects=False)
+    assert refused.status == 403
+
+
+async def test_layout_zero_without_picks_is_untouched(mw):
+    shift = _layout_zero(mw)
+    sid = int(LIVE_STREAMS[1]["stream_id"]) + shift
+    r = await mw.get(f"/live/{USER}/{PASSWORD}/{sid}.ts", allow_redirects=False)
+    assert r.status == 302
+    r = await mw.get(f"/xmltv.php?{Q}", headers={"Accept-Encoding": "identity"})
+    assert await r.read() == GUIDE
